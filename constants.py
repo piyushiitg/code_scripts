@@ -1,0 +1,27 @@
+
+class SystemMonitorStat:
+    VALIDATE_CRON_INFO=50
+    INCOMPATIBLE_TCP_LOCAL_PORT_RANGE=51
+    INCOMPATIBLE_TCP_RESERVED_PORT_RANGE=52
+    SYSTEM_MEMORY_CONSUMPTION=53
+    SYSTEM_SWAP_CONSUMPTION=54
+    SYSTEM_DISK_CONSUMPTION=55
+    VALIDATE_SYSTEM_PROCESS=56
+    CERTIFICATE_EXPIRE=57
+    
+    @classmethod
+    def get_all_events(cls):
+        return [cls.VALIDATE_CRON_INFO, 
+               cls.INCOMPATIBLE_TCP_LOCAL_PORT_RANGE,
+               cls.INCOMPATIBLE_TCP_RESERVED_PORT_RANGE, 
+               cls.SYSTEM_MEMORY_CONSUMPTION,
+               cls.SYSTEM_SWAP_CONSUMPTION, 
+               cls.SYSTEM_DISK_CONSUMPTION, 
+               cls.VALIDATE_SYSTEM_PROCESS, 
+               cls.CERTIFICATE_EXPIRE]
+
+
+class ThresholdValue:
+    USED_MEMORY = 1048576000
+
+
