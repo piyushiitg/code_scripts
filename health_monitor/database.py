@@ -1,7 +1,10 @@
 from abc import ABCMeta, abstractmethod
+import idb.util as util
 import socket
-from sqlite import SqliteHandler
 import sys
+
+MAX_RETRY = 3
+
 class Database(object):
     ''' Superclass of all the database class'''
     __metaclass__ = ABCMeta
@@ -17,17 +20,31 @@ class Database(object):
         self.database = kwargs.get('database','')
         self.function = kwargs.get('function','')
 
+
     def get_servers_from_sqlite(self, db_file_name, cluster_id):
+        '''
+        Read a list of all server_ids with the status field.
+        '''
         servers_list = []
-        sqlhandler = SqliteHandler()
-        query = "select ipaddress, port from lb_servers where clusterid = %s" % (cluster_id)
-        result = sqlhandler.get_sqlite_data(db_file_name, query)
-        for ip, port in result:
-            if self.db_type == 'MSSQL':
-                new_ip = self.get_proper_server_addr(ip)
-            else:
-                new_ip = ip 
-            servers_list.append((new_ip, port))
+        sqlite_handle = util.get_sqlite_handle(db_file_name)
+        if sqlite_handle:
+            db_cursor = sqlite_handle.cursor()
+            query = "select ipaddress, port, serverid from lb_servers where clusterid = %s" % (cluster_id)
+            retry = 0
+            while retry < MAX_RETRY:
+                try:
+                    db_cursor.execute(query)
+                    for ip, port, serverid in db_cursor.fetchall():
+                        if self.db_type == 'MSSQL':
+                            new_ip = self.get_proper_server_addr(ip)
+                        else:
+                            new_ip = ip 
+                    servers_list.append((new_ip, port, serverid))
+                    break
+                except Exception, ex:
+                    retry = retry + 1
+                    time.sleep(0.1)
+            util.close_sqlite_resources(sqlite_handle, db_cursor)
         return servers_list
 
     def get_proper_server_addr(self, ip):
@@ -57,17 +74,19 @@ class Database(object):
                 errno, errstr = sys.exc_info()[:2]
                 if errno == socket.timeout:
                     #print "Timeout has occured ", server_ip 
-                    result ="Timeout has occured %s" %server_ip
+                    #result ="Timeout has occured %s" %server_ip
+                    result = False
                 else:
                     result = "Error occured while creating socket connections %s" %server_ip
+                    result = False
             except Exception, ex:
                 retry = retry + 1
                 result = "Some Exception While using socket %s" %ex
+                result = False
             finally:
                 if test_socket:
                     test_socket.close()
         return result
-
     
     def query_monitor(self, inputdata):
         pass

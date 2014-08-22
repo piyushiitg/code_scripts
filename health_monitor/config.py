@@ -9,7 +9,7 @@ database_configuration = {
                                     'socket_retry' : 3,
                                     'query_retry' : 3,
                                     'query': {'default': "select 1", 'custom': '', 'dbdefault':''},
-                                    'function' : ['socket', 'query'],
+                                    'function' : ['socket'],
                                     'database' : ''
                                     },
                         'MYSQL' : {
@@ -20,7 +20,7 @@ database_configuration = {
                                     'socket_retry' : 3,
                                     'query_retry' : 3,
                                     'query': {'default': "select 1", 'custom': '', 'dbdefault':''},
-                                    'function' : ['socket', 'query'],
+                                    'function' : ['socket'],
                                     'database' : '',
                                     },
                         'MSSQL' : {
