@@ -1,7 +1,11 @@
 
 #!/usr/bin/python
 #
-# Copyright (C) 2012 ScalArc, Inc., all rights reserved.
+# Copyright (C) 2014 ScalArc, Inc., all rights reserved.
+##
+# Revision : 1.4 (Release)
+# Author   : Piyush Singhai
+# Date     : 24/11/2014
 #
 #
 # Revision : 1.3 (Release)
@@ -41,6 +45,8 @@ import signal
 import glob
 import random
 from copy import deepcopy
+import json
+import httplib
 #
 # import modules from site-packages. iDB pacakge has to be installed before
 # the following modules can be imported
@@ -52,14 +58,14 @@ import idb.util as util
 from idb.cluster_util import PasswordUtils 
 import gevent
 from gevent import Timeout
-#from gevent import monkey
-#monkey.patch_all()
 from gevent import queue
 import ConfigParser
+from idb import events
+from idb.cmd.system_monitor.constants import SystemMonitorStat
 
 ####### Global Variables ##########
 _debug = False
-
+APIKEY = ""
 SCRIPT_VERSION = 1.0
 GLOBAL_LB_SQLITE_FILE = '/system/lb.sqlite'
 LB_SQLITE_FILE = '/system/lb_%s.sqlite'
@@ -91,10 +97,13 @@ TIME_TO_WAIT_FOR_CHILD_JOIN = 60 # in seconds
 
 STATUS_UP = 1
 STATUS_DOWN = 0
-####################################
+################Always On 2014 ####################
 ALWAYS_ON_2014 = "Microsoft SQL Server 2014"
 ALWAYS_ON_2012 = "Microsoft SQL Server 2012"
 RESOLVING_ROLE = 0
+OFFLINE = 3
+UP = 1
+DOWN = 0
 HEALTH_DOWN_OP_STATE = [0, 1, 4, 5]
 HEALTH_UP_OP_STATE = [2, 3] 
 
@@ -173,7 +182,13 @@ class AlwaysOnMonitorUtils(object):
         self._health_status = {} # dict that contains {end_url: connected_state} 
         self.always_on_server_type = ''       
         self.threads_list = []
-        self.queue = queue.Queue()
+
+        self._delete_servers_from_config = []
+        self._found_new_servers = []
+        self._ui_alert_for_del_servers = {}
+        self._ui_alert_for_add_servers = {}
+        self.events = events.Event()
+        self.health_queue = queue.Queue()
         self.get_default_options()
 
     def get_default_options(self):
@@ -197,7 +212,7 @@ class AlwaysOnMonitorUtils(object):
 
         try:
             self._is_split_ag_id = int(_config.get('default', 'split_ag_id'))
-            _logger.error("Split ag_id flag is : %s" %
+            _logger.info("Split ag_id flag is : %s" %
                              self._is_split_ag_id)
         except Exception, ex:
             self._is_split_ag_id = 0
@@ -313,7 +328,7 @@ class AlwaysOnMonitorUtils(object):
                            " info %s" % (self._cluster_id, self._vnn_info))
             util.close_sqlite_resources(db_handle, cursor)
 
-    def _get_health_info_servers(self, connection=None):
+    def _get_health_info_servers(self, connection=None, multigevent=False):
         ''' Fetch helath information for all node from the table
         master.sys.dm_hadr_availablity_replica_states'''
 
@@ -336,7 +351,17 @@ class AlwaysOnMonitorUtils(object):
                                      % (self._cluster_id, ex))
             if _connection:
                 _connection.close()
-            return {}
+            #
+            # When Primary server is availiable but we could not make a connection with that server
+            # then we need to fetch health from each of the server and fill the self._health_status dict
+            #
+            if connection == None and multigevent:
+                health_status = self.get_all_servers_health()
+                self._health_status = health_status
+                return health_status
+
+            self._health_status = {}
+            return self._health_status
 
         try:
             if self._vnn_info.has_key('group_id'):
@@ -347,6 +372,8 @@ class AlwaysOnMonitorUtils(object):
                        "and a.group_id='%s'" % self._vnn_info['group_id']
                 
             else:
+                _logger.debug("AlwaysOnMonitor(%d): No Groupid in vnn_info returning empty health info" 
+                               % (self._cluster_id))
                 self._health_status = {}
                 return self._health_status
             
@@ -383,7 +410,43 @@ class AlwaysOnMonitorUtils(object):
             _logger.debug("AlwaysOnMonitor(%d): Health status is %s " \
                               % (self._cluster_id, self._health_status))
             return self._health_status
+    
+    def get_all_servers_health(self):
+        '''
+        This Function check for health 
+        '''
+        try:
+            _logger.debug("AlwaysOnMonitor(%d): Get all servers health" \
+                                    % self._cluster_id)
+            gevent.with_timeout(20, self.read_servers_health_using_gevent)
+        except Timeout:
+            _logger.error("AlwaysOnMonitor(%d): Timeout at gevent to see all servers health" \
+                                    % self._cluster_id)
+        except Exception, ex:
+            _logger.error("AlwaysOnMonitor(%d): Exception at gevent start %s" \
+                                    % (self._cluster_id, ex))
+        finally:
+            _logger.debug("AlwaysOnMonitor(%d): Stopping all the Gevents" \
+                                    % self._cluster_id)
+            self.stop_threads()
 
+        new_health_info = {}
+        for health_dict in self.health_queue.queue:
+            _logger.debug("AlwaysOnMonitor(%d): All servers health dict %s " % (self._cluster_id, health_dict))
+            if not health_dict:
+                continue
+            try:
+                server_ip = health_dict['ip']
+                health_status, role, op_state = health_dict['new_health_info']
+                _logger.error("AlwaysOnMonitor(%d): got new health info" \
+                              " server_ip %s connected_state %s role %s op_state %s" \
+                              %(self._cluster_id, server_ip, health_status, role, op_state))
+                new_health_info[server_ip] = [health_status, role, op_state]
+            except Exception, ex:
+                _logger.error("AlwaysOnMonitor(%d): Exception reading health %s" \
+                                 % (self._cluster_id, ex))
+        return new_health_info 
+               
     def _parse_hostname_from_endpoint_url(self, endpoint_url):
         '''
         Convert end point url to hostname in the format that we undestand and
@@ -618,10 +681,10 @@ class AlwaysOnMonitorUtils(object):
 
         For now we refresh data every cycle.
         '''
-        _logger.debug("AlwaysOnMonitor(%d): refresh state data with force_refresh %s " \
-                          % (self._cluster_id, force_refresh))
         if ((time.time() - self._last_state_updated) >= self._state_refresh_interval) \
             or force_refresh:
+            _logger.info("AlwaysOnMonitor(%d): Refreshing Sqlite information and force_refresh is %s " \
+                          % (self._cluster_id, force_refresh))
             _logger.debug("AlwaysOnMonitor(%d): Refreshing VNN Information " \
                           % self._cluster_id)
             self._load_vnn_info_from_sqlite()
@@ -682,153 +745,68 @@ class AlwaysOnMonitorUtils(object):
             if cursor:
                 cursor.close()
         return ""
-         
-    def _retrieve_latest_server_stats(self):
-        '''
-        Obtain latest server stats against which we will compare the one we
-        obtained from sqlite.
-        1. If vnn info is available then obtain the latest server's role info
-            from it.
-            else
-        2. query any server which can provide info of all servers in this
-            cluster.
-        3. Information is obtained in two steps:
-            3.1) determine role : find the primary and secondary servers
-                values expected: 0,1
-
-            3.2) For each server obtain the connection type.
-                values expected:
-                    primary: 1,2
-                    secondary: 4,5,6
-
-    <iDB type>                : 0 -> 'R/W (Primary)'
-                              : 1 -> 'R-Only (Secondary)'
-                              : 2 -> 'W-Only (not used)'
-    <sql2012_role_setting>    : 1 -> 'Primary - Allow all connections'
-                              : 2 -> 'Primary - Read/Write only'
-                              : 4 -> 'Secondary - Yes'
-                              : 5 -> 'Secondary - Read-Intent Only' * call tapas code
-                              : 6 -> 'Secondary = No'  * just do nothing, return 0
-        Find primary
-            if availabilty group is is present use that in the queries else 
-            query without it.
-
-            With group_id:
-                **select endpoint_url from sys.availability_replicas where
-                replica_server_name = (select primary_replica from
-                sys.dm_hadr_availability_group_states where group_id=group_id)
-                and group_id=group_id;
-            else:
-                **select endpoint_url from sys.availability_replicas where
-                replica_server_name = (select primary_replica from
-                sys.dm_hadr_availability_group_states);
-
-
-
-        find roles:
-            select replica_server_name,primary_role_allow_connections_desc,
-            secondary_role_allow_connections_desc from sys.availability_replicas;
-
-            With group_id:
-                **select endpoint_url,primary_role_allow_connections_desc,
-                secondary_role_allow_connections_desc from sys.availability_replicas 
-                where group_id=group_id;
-            else:
-                **select endpoint_url,primary_role_allow_connections_desc,
-                secondary_role_allow_connections_desc from sys.availability_replicas;
-        '''
-        self._new_primary_server = ''
-        self._new_servers_list = []
-
+        
+    def find_primary_server(self):
+        ''' Executing Query for finding out Primary server
+        ''' 
+        new_primary_server = ''
         try:
             cursor = self._connection.cursor()
-        except Exception, ex:
-            _logger.error("AlwaysOnMonitor(%d): Problem determining cursor " \
-                            ": %s" % (self._cluster_id, ex))
-            return
-        try:
             if self._vnn_info.get('group_id'):
                 query = "select endpoint_url from sys.availability_replicas "\
                            "where replica_server_name = (select primary_replica "\
                            "from sys.dm_hadr_availability_group_states where group_id='%s') "\
                            "and group_id='%s'" % (self._vnn_info.get('group_id'),
                                                    self._vnn_info.get('group_id'))
-                         
-                _logger.debug("AlwaysOnMonitor(%d): Query for Primary server  " \
-                           " %s" % (self._cluster_id, query))
-                cursor.execute("""select endpoint_url from sys.availability_replicas 
-                                where replica_server_name = (select primary_replica 
-				                from sys.dm_hadr_availability_group_states where group_id=?) 
-                                and group_id=?""", self._vnn_info.get('group_id'),
-                                                   self._vnn_info.get('group_id'))
-                
-                _logger.debug("AlwaysOnMonitor(%d): Query Executed for Primary server" \
-                           " info" % (self._cluster_id))
             else:
                 query = "select endpoint_url from sys.availability_replicas "\
                         "where replica_server_name = (select primary_replica "\
                         "from sys.dm_hadr_availability_group_states)"""
-                _logger.debug("AlwaysOnMonitor(%d): Query for Primary server" \
+                 
+            _logger.debug("AlwaysOnMonitor(%d): Query for finding Primary server  " \
                            " %s" % (self._cluster_id, query))
-                cursor.execute("""select endpoint_url from sys.availability_replicas 
-                                     where replica_server_name = (select primary_replica 
-                                     from sys.dm_hadr_availability_group_states)""")
-
-                _logger.debug("AlwaysOnMonitor(%d): Query Executed for Primary server" \
-                           " info" % (self._cluster_id))
-            
+            cursor.execute(query)
             row = cursor.fetchone()
             
             _logger.debug("AlwaysOnMonitor(%d): Result of Query Primary server" \
                            " %s info" % (self._cluster_id, row))
             if row:
-                self._new_primary_server = self._parse_hostname_from_endpoint_url(row[0])
-                self._primary_ip = self._new_primary_server
-                self._primary_port = self._get_server_port(self._primary_ip)
+                new_primary_server = self._parse_hostname_from_endpoint_url(row[0])
+                primary_ip = new_primary_server
+                primary_port = self._get_server_port(primary_ip)
             _logger.debug("AlwaysOnMonitor(%d): new primary server is " \
-                           " %s " % (self._cluster_id, self._new_primary_server))
+                           " %s " % (self._cluster_id, new_primary_server))
         except Exception, ex:
-            _logger.error("AlwaysOnMonitor(%d): Problem determining current " \
-                            "master: %s" % (self._cluster_id, ex))
-            self._new_primary_server = ''
+            _logger.error("AlwaysOnMonitor(%d): Problem determining current primary " \
+                            "server: %s" % (self._cluster_id, traceback.format_exc()))
+        finally:
+            cursor.close()
+            return new_primary_server
 
-        cursor.close()
-        if self._new_primary_server == '':
-            return
-
-        _logger.debug("AlwaysOnMonitor(%d): Primary replica from vnn: %s" \
-                      % (self._cluster_id, self._new_primary_server))
-        # now read all servers information including their roles
-        cursor = self._connection.cursor()
+    def find_servers_role_type(self):
+        '''Now read all servers information including their roles
+        '''
+        new_servers_list = []
         try:
+            cursor = self._connection.cursor()
             if self._vnn_info.get('group_id'):
                 query = "select endpoint_url, primary_role_allow_connections_desc, "\
-			            "secondary_role_allow_connections_desc from " \
+			"secondary_role_allow_connections_desc from " \
                         "sys.availability_replicas where group_id='%s'" \
 			             % (self._vnn_info.get('group_id'))
-                _logger.debug("AlwaysOnMonitor(%d): Query for servers and their roles" \
-                           " %s with agid" % (self._cluster_id, query))
-                cursor.execute("""select endpoint_url, primary_role_allow_connections_desc, 
-                                    secondary_role_allow_connections_desc from 
-                                    sys.availability_replicas where group_id=?""",
-                                    self._vnn_info.get('group_id'))
-                _logger.debug("AlwaysOnMonitor(%d): executed Query for servers and roles" \
-                               " info" % (self._cluster_id))
             else:
                 query = "select endpoint_url, primary_role_allow_connections_desc, "\
-                           "secondary_role_allow_connections_desc from "\
-                           "sys.availability_replicas"
-                _logger.debug("AlwaysOnMonitor(%d): Query for servers and their roles" \
-                           " %s without agid" % (self._cluster_id, query))
-                cursor.execute("""select endpoint_url, primary_role_allow_connections_desc, 
-                                    secondary_role_allow_connections_desc from 
-                                    sys.availability_replicas""")
-                _logger.debug("AlwaysOnMonitor(%d): executed Query for servers and roles" \
-                               " without agid" % (self._cluster_id))
-
-            for row in cursor.fetchall():
+                        "secondary_role_allow_connections_desc from "\
+                        "sys.availability_replicas"
+            _logger.debug("AlwaysOnMonitor(%d): Query for servers and their roles" \
+                          " %s with agid" % (self._cluster_id, query))
+            cursor.execute(query)
+            _logger.debug("AlwaysOnMonitor(%d): executed Query for servers and roles" \
+                               " info" % (self._cluster_id))
+            rows = cursor.fetchall()
+            for endpoint_url, primary_role, secondary_role in rows:
                 d = {}
-                d['ip'] = self._parse_hostname_from_endpoint_url(row[0])
+                d['ip'] = self._parse_hostname_from_endpoint_url(endpoint_url)
 
                 # determine whether it's primary or secondary
                 if d['ip'] == self._new_primary_server:
@@ -838,25 +816,36 @@ class AlwaysOnMonitorUtils(object):
 
                 # determine the role of this server
                 if d['type'] == PRIMARY:
-                    d['role'] = PRIMARY_ROLE_MAP[row[1]] # READ_WRITE/ALL
+                    d['role'] = PRIMARY_ROLE_MAP[primary_role] # READ_WRITE/ALL
                 else:
-                    d['role'] = SECONDARY_ROLE_MAP[row[2]] # NO/ALL/READ_ONLY
+                    d['role'] = SECONDARY_ROLE_MAP[secondary_role] # NO/ALL/READ_ONLY
 
-                self._new_servers_list.append(d)
+                new_servers_list.append(d)
             
-            _logger.debug("AlwaysOnMonitor(%d): Results Query for servers and roles" \
-                               " %s info" % (self._cluster_id, self._new_servers_list))
-
         except Exception, ex:
-            _logger.error("AlwaysOnMonitor(%d): Problem while reading role " \
-                          "information from server: %s" % (self._cluster_id, ex))
-            self._new_servers_list = []
+            _logger.error("AlwaysOnMonitor(%d): Exception while reading role " \
+                          "information from server: %s" % (self._cluster_id, traceback.format_exc()))
+        finally:
+            cursor.close()
+            return new_servers_list
+    
+    def _retrieve_latest_server_stats(self):
+        ''' Get latest server stats from sqlserver
+        '''
+        #self._new_primary_server = ''
+        self._new_primary_server = self.find_primary_server()
+        if self._new_primary_server == '':
+            return
+        self._primary_ip = self._new_primary_server
+        self._primary_port = self._get_server_port(self._primary_ip)
 
-        cursor.close()
+        self._new_servers_list = []
+        self._new_servers_list = self.find_servers_role_type()
+
         try: 
             _logger.debug("AlwaysOnMonitor(%d): Reading health Information" \
                                " for all servers" % (self._cluster_id))
-            self._get_health_info_servers()
+            self._get_health_info_servers(multigevent=True)
         except Exception, ex:
             _logger.error("AlwaysOnMonitor(%d): Problem while reading health status " \
                           "information from server: %s" % (self._cluster_id, ex))
@@ -901,13 +890,6 @@ class AlwaysOnMonitorUtils(object):
             _logger.error("AlwaysOnMonitor(%d): Does not recognize server: %s." \
                           " Can't set it as new primary server." \
                           % (self._cluster_id, self._new_primary_server))
-            #
-            # TODO:
-            # Is it right to quit when we find a strange server? May be we can
-            # continue processing role change for servers that we can
-            # understand.
-            #
-            return False
 
         # now we have a valid primary server
         if self._old_master == self._new_primary_server:
@@ -1015,15 +997,21 @@ class AlwaysOnMonitorUtils(object):
         # we will assume self._old_servers_list as the base reference for
         # comparison
         role_change_list = []
+        old_servers_ip_list = [] 
+        new_servers_ip_list = []
         
         for old_server in self._old_servers_list:
             server_found_in_newlist = False
+            old_servers_ip_list.append(old_server['ip'])
 
             for new_server in self._new_servers_list:
+                if new_server['ip'] not in new_servers_ip_list:
+                    new_servers_ip_list.append(new_server['ip'])
+                     
                 if old_server['ip'] == new_server['ip']:
-                    _logger.info("AlwaysOnMonitor(%d): check any change for old " \
-                          "server %s and new server %s " \
-                           % (self._cluster_id,old_server, new_server))
+                    _logger.info("AlwaysOnMonitor(%d): Check between old " \
+                          "server %s and new server %s changes " \
+                           % (self._cluster_id, old_server, new_server))
                     server_found_in_newlist = True
                     # determine serverid
                     server_id = self._get_serverid(new_server['ip'])
@@ -1040,8 +1028,8 @@ class AlwaysOnMonitorUtils(object):
                     # two servers (secondary->primary) and (primary->secondary)
                     #
                     health_status = self._health_status.get(old_server['ip'], [0])[0]
-                    _logger.debug("AlwaysOnMonitor(%d): Health status for ip %s & health_dict %s" \
-                          % (self._cluster_id, old_server['ip'], self._health_status))
+                    _logger.debug("AlwaysOnMonitor(%d): Health status for ip %s is %s where health_dict is %s" \
+                          % (self._cluster_id, old_server['ip'], health_status, self._health_status))
                
                     if old_server['type'] != new_server['type']:
                         break
@@ -1060,26 +1048,59 @@ class AlwaysOnMonitorUtils(object):
                         if (health_status != old_server.get('health_status')):
                             msg = ''
                             try:
-                                _logger.debug("AlwaysOnMonitor(%d): Health status is changed for ip %s health_dict %s \
-                                              old_server %s"
-                                     %(self._cluster_id, old_server['ip'], self._health_status, \
+                                _logger.info("AlwaysOnMonitor(%d): Health status is changed for ip %s to %s where health_dict is %s \
+                                              and old_server health is %s"
+                                     %(self._cluster_id, old_server['ip'], health_status, self._health_status, \
                                        old_server.get('health_status')))
                                 msg = '%d:%d:%d:%d|' % (server_id, new_server['type'], \
                                                      new_server['role'], health_status)
                                 role_change_list.append(msg)
                             except Exception, ex:
                                 _logger.error("AlwaysOnMonitor(%d): Problem generating" \
-                                             " health staus change string. %s" \
+                                             " health status change string. %s" \
                                              % self._cluster_id, ex)
     
                     # we break out of loop since we have found the server in newlist
                     break
  
             if not server_found_in_newlist:
-                _logger.warn("AlwaysOnMonitor(%d): Server %s not found in " \
-                             "latest server list." % (self._cluster_id, \
+                msg = ''
+                try:
+                    tmp_del_dict = {'cluster_id':'', 'server_id':'', 'server_ip': ''}
+                    # Server Not found case we are marking server down
+                    _logger.warn("AlwaysOnMonitor(%d): Server %s not found in " \
+                             "latest server list and remove that server from config" % (self._cluster_id, \
                                                       old_server['ip']))
+                    server_id = self._get_serverid(old_server['ip'])
+                    cluster_server_id_dict = deepcopy(tmp_del_dict)
+                    cluster_server_id_dict['cluster_id'] = self._cluster_id
+                    cluster_server_id_dict['server_id'] = server_id
+                    cluster_server_id_dict['server_ip'] = old_server['ip']
+                    self._delete_servers_from_config.append(cluster_server_id_dict)
+                except Exception, ex:
+                    _logger.error("AlwaysOnMonitor(%d): Problem generating" \
+                                             " in deleted server string. %s" \
+                                             % self._cluster_id, ex)
+        try:
+            # Check any server is added in AlwaysOn AG
+            if len(self._new_servers_list) != len(new_servers_ip_list): 
+                for new_server in self._new_servers_list:
+                    if new_server['ip'] not in new_servers_ip_list:
+                        new_servers_ip_list.append(new_server['ip'])
 
+            old_servers_ip_set = set(old_servers_ip_list)
+            new_servers_ip_set = set(new_servers_ip_list)
+            self._found_new_servers = new_servers_ip_set.difference(old_servers_ip_set)
+    
+            if len(self._found_new_servers) > 0:
+                _logger.debug("AlwaysOnMonitor(%d): Found new Server on AlwaysOn AG %s " \
+                              "detected in cluster" % (self._cluster_id, self._found_new_servers))
+
+            if len(self._delete_servers_from_config) > 0:
+                _logger.debug("AlwaysOnMonitor(%d): Found some Server removed on AlwaysOn AG %s " \
+                              "detected in cluster" % (self._cluster_id, self._delete_servers_from_config))
+        except Exception, ex:
+            _logger.error("AlwaysOnMonitor(%d): Exception in calculated newly added server %s" %(self._cluster_id, ex))
 
         if len(role_change_list) == 0 and self._msg_for_core == '':
             _logger.debug("AlwaysOnMonitor(%d): No server type or role change " \
@@ -1204,8 +1225,6 @@ class AlwaysOnMonitorUtils(object):
                              "Exiting now" % self._cluster_id)
                 return
 
-            _logger.info("AlwaysOnMonitor(%d): Refreshing sqlite stats" \
-                          % self._cluster_id)
             # 1. refresh state data
             self._refresh_state_data()
 
@@ -1226,18 +1245,15 @@ class AlwaysOnMonitorUtils(object):
             _logger.info("AlwaysOnMonitor(%d): *Start* Retrieving latest server stats" \
                           % self._cluster_id)
             self._retrieve_latest_server_stats()
-
+            
             # Check for resolving state of the server 
-            _logger.info("AlwaysOnMonitor(%d): Retrieving resolving stats" \
-                          % self._cluster_id)
             try:
-                _logger.debug("AlwaysOnMonitor(%d): Start Resolve check" \
-                          % self._cluster_id)
-                           
                 if self._check_resolving_state_inform_core():
+                    time.sleep(1)
                     continue
-                _logger.debug("AlwaysOnMonitor(%d): End Resolve check" \
-                          % self._cluster_id)
+                else:
+                    _logger.info("AlwaysOnMonitor(%d): Cluster not Resolving State where Primary Server is %s" \
+                          % (self._cluster_id, self._new_primary_server))
             except Exception, ex:
                 _logger.error("AlwaysOnMonitor(%d): Error in check resolving stats %s" \
                           % (self._cluster_id, ex))
@@ -1247,7 +1263,7 @@ class AlwaysOnMonitorUtils(object):
             self._msg_for_core = ''
 
             # detect any change in primary server for this cluster.
-            _logger.info("AlwaysOnMonitor(%d): Processing primary server change" \
+            _logger.info("AlwaysOnMonitor(%d): Checking primary server role changes if any" \
                           % self._cluster_id)
             
             if not self._process_primary_server_change():
@@ -1255,23 +1271,50 @@ class AlwaysOnMonitorUtils(object):
                 continue
 
             # 3. now find any change in roles.
-            _logger.info("AlwaysOnMonitor(%d): Processing role change for " \
-                          "servers" % self._cluster_id)
+            _logger.info("AlwaysOnMonitor(%d): Checking role and health changes for all" \
+                          "servers if any" % self._cluster_id)
             self._process_role_and_health_change()
             
-            _logger.info("AlwaysOnMonitor(%d): processed primary server change " \
-                          "servers" % self._cluster_id)
             if self._writeback_changes_to_sqlite():
                 # 4. if writeback to sqlite was successful then lets inform core
                 # of the same.
                 self._inform_core_about_role_change()
-
                 #Refresh state data forecefully
                 self._refresh_state_data(True)
 
+            # Process any server added or deleted   
+            self._check_server_add_or_del() 
             # sleep for a while and then begin the cycle
             time.sleep(1)
 
+    def _check_server_add_or_del(self):
+        ''' Send UI alert for server addition or deletion
+        '''
+        try:
+            # check any server is deleted from AlwaysOn AG
+            while self._delete_servers_from_config:
+                del_server_dict = self._delete_servers_from_config.pop()
+                if del_server_dict['server_ip'] not in self._ui_alert_for_del_servers:
+                    _logger.warn("AlwaysOnMonitor(%d): Delete servers from " \
+                              " form ScaleArc Configuration and del dict is %s" % (self._cluster_id, del_server_dict))
+                    res = self._do_deletion(del_server_dict['cluster_id'], del_server_dict['server_id'])
+                    _logger.debug("AlwaysOnMonitor(%d): API Response for server deletion is %s" %(self._cluster_id, res))
+                    if res['success']:
+                        self._send_alert_about_server_status("deleted_server", del_server_dict['server_ip'], del_server_dict['server_id'])
+                        self._ui_alert_for_del_servers[del_server_dict['server_ip']] = 1
+                             
+            # Check any server is added on AlwaysOn AG
+            while self._found_new_servers:
+                newserver_ip = self._found_new_servers.pop()
+                if newserver_ip not in self._ui_alert_for_add_servers:
+                    _logger.warn("AlwaysOnMonitor(%d): Added servers On " \
+                              " Always On AG, Not going to add on scalearc configuration %s" % (self._cluster_id, newserver_ip))
+                    servers_count = len(self._ui_alert_for_add_servers)
+                    self._send_alert_about_server_status("added_server", newserver_ip, servers_count)
+                    self._ui_alert_for_add_servers[newserver_ip] = 1
+        except Exception, ex:
+            _logger.error("AlwaysOnMonitor(%d): Exception while sending alert %s" %(self._cluster_id, ex))
+            
     def _check_resolving_state_inform_core(self):
         '''
         This Function check for resolving state of the any server
@@ -1280,7 +1323,7 @@ class AlwaysOnMonitorUtils(object):
         result = False
         if not self._new_primary_server:
             result = True
-            _logger.info("AlwaysOnMonitor(%d): Type is %s  Resolving No primary server" \
+            _logger.info("AlwaysOnMonitor(%d): Start Reslove Check Type is %s Resolving No primary server" \
                           % (self._cluster_id, self.always_on_server_type))
             role_change_list = []
             self._msg_for_core = ''
@@ -1290,7 +1333,7 @@ class AlwaysOnMonitorUtils(object):
                 try:
                     _logger.debug("AlwaysOnMonitor(%d):2014: Start a process with timeout 10 sec" \
                                  % self._cluster_id)
-                    gevent.with_timeout(10, self.always_on_2014_resolve_check)
+                    gevent.with_timeout(10, self.read_servers_health_using_gevent)
                     _logger.debug("AlwaysOnMonitor(%d):2014: End a process with timeout 10 sec" \
                                  % self._cluster_id)
                 except Timeout:
@@ -1304,12 +1347,12 @@ class AlwaysOnMonitorUtils(object):
                                  % self._cluster_id)
                     self.stop_threads()
                 _logger.debug("AlwaysOnMonitor(%d):2014: gevent results are %s" \
-                                % (self._cluster_id, self.queue))
+                                % (self._cluster_id, self.health_queue))
                 _logger.debug("AlwaysOnMonitor(%d):2014 old server results are %s" \
                                 % (self._cluster_id, self._old_servers_list))
                 _logger.debug("AlwaysOnMonitor(%d):2014 Start Processing Queue Results" \
                                 % (self._cluster_id))
-                for health_dict in self.queue.queue:
+                for health_dict in self.health_queue.queue:
                     _logger.debug("AlwaysOnMonitor(%d): 2014 health dict %s " 
                                   % (self._cluster_id, health_dict))
                     if not health_dict:
@@ -1332,9 +1375,9 @@ class AlwaysOnMonitorUtils(object):
                         for old_server in self._old_servers_list:
                             new_status = 0
                             if old_server['ip'] == server_ip:
-                                if health_status == 0:
+                                if health_status == RESOLVING_ROLE:
                                     if (op_state in HEALTH_DOWN_OP_STATE) or \
-                                            (op_state == 3 and old_server['type'] == 0):
+                                            (op_state == OFFLINE and old_server['type'] == PRIMARY):
                                         new_status = 0
                                     elif op_state in HEALTH_UP_OP_STATE:
                                         new_status = 1
@@ -1383,10 +1426,58 @@ class AlwaysOnMonitorUtils(object):
                     _logger.debug("AlwaysOnMonitor(%d): Resolve Inform to core and set resolving state" \
                                    % self._cluster_id)
                     result = True
+
             _logger.info("AlwaysOnMonitor(%d): Exit form resolve check" % self._cluster_id)   
             self._msg_for_core = ''
         return result
-    def always_on_2014_resolve_check(self):
+    
+    def _do_deletion(self, cluster_id, server_id):
+        ip_addr = '127.0.0.1'
+        master_base_url_path = '/api/cluster/' + str(cluster_id) + '/server/' + str(server_id) + '?apikey=%s' %APIKEY 
+        data_dict = {}
+        #data_dict["apikey"] = APIKEY
+        res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'DELETE')
+        res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'DELETE')
+        _logger.debug("AlwaysOnMonitor(%d): Result from API for server delete is %s" \
+                                   % (self._cluster_id, res))
+        return res
+
+    def _exec_url_generic(self, ip_addr, base_url_path, data_dict, method='PUT'):
+        '''
+        Makes an http call with the specified method and returns the result.
+        '''
+        result = 'Failed to make http call.'
+        try:
+            conn = httplib.HTTPSConnection(ip_addr)
+            conn.request(method, base_url_path, data_dict)
+            response = conn.getresponse()
+            result = json.loads(response.read())
+        except Exception, ex:
+            _logger.error("Failed to make http call: %s" % ex)
+            result = result
+        return result
+    
+    def _send_alert_about_server_status(self, msg_header, server_ip, server_id=0):
+        ''' Send alert to alert_engine service
+        '''
+        msg_dict = {
+                   "deleted_server":"ScaleArc detected that server %s is removed from AlwaysOn Group %s. "\
+                   "It has been deleted from the ScaleArc cluster configuration.",
+                   "added_server": "ScaleArc detected that a new server %s was added on AlwaysOn Group %s. Please add it to the ScaleArc cluster configuration.",
+                   }
+        message = msg_dict[msg_header]
+        message = message % (server_ip, self._vnn_info.get('vnn_server'))
+        _logger.info("AlwaysOnMonitor(%d): ALERTMSG: Server Status is change %s" % (self._cluster_id, message))
+        
+        #Sending alert to UI
+        if msg_header == "deleted_server":
+            msg_type = str(SystemMonitorStat.SERVER_DELETED_FROM_ALWAYSON)
+        else:
+            msg_type = str(SystemMonitorStat.SERVER_ADDED_ON_ALWAYSON)
+        result = self.events.send_event(message, int(msg_type), clusterid=self._cluster_id, serverid=server_id)
+        _logger.info("AlwaysOnMonitor(%d): response from API for sending events %s" % (self._cluster_id, result))
+
+    def read_servers_health_using_gevent(self):
         '''
         This Function check for resolving state and health 
         report the health 
@@ -1395,15 +1486,15 @@ class AlwaysOnMonitorUtils(object):
         for old_server in self._old_servers_list:
             name = 'gevent' + str(i)
             i = i + 1
-            _logger.info("AlwaysOnMonitor(%d): 2014: Added greenlet for %s name is %s" \
+            _logger.info("AlwaysOnMonitor(%d): Added greenlet for %s name is %s" \
                               % (self._cluster_id, old_server, name))
             self.threads_list.append(gevent.spawn(self.check_secondary_servers_health, old_server, name))
-        _logger.debug("AlwaysOnMonitor(%d): 2014: emptying the queue" % self._cluster_id)
-        self.queue.queue.clear()
-        while self.queue.qsize() < len(self._old_servers_list):
-            _logger.debug("AlwaysOnMonitor(%d):2014: Queue size less then " \
+        _logger.debug("AlwaysOnMonitor(%d): emptying the queue" % self._cluster_id)
+        self.health_queue.queue.clear()
+        while self.health_queue.qsize() < len(self._old_servers_list):
+            _logger.debug("AlwaysOnMonitor(%d): Queue size less then " \
                            "number of servers %s and lenth of queue %s" \
-                           % (self._cluster_id, len(self._old_servers_list), self.queue.qsize()))
+                           % (self._cluster_id, len(self._old_servers_list), self.health_queue.qsize()))
 	    gevent.sleep(1)
                
     def always_on_2012_resolve_check(self):
@@ -1452,44 +1543,44 @@ class AlwaysOnMonitorUtils(object):
             port = server_info['port']
             conn_str = self._get_connection_string(server_ip=ip,
                                             server_port=port)
-            _logger.debug("AlwaysOnMonitor(%d): 2014 %s try to get the connection" \
+            _logger.debug("AlwaysOnMonitor(%d): %s try to get the connection" \
                                   % (self._cluster_id, name)) 
             connection = self._get_connection(ip, port, conn_str)
-            _logger.debug("AlwaysOnMonitor(%d): 2014 %s got the connection" \
+            _logger.debug("AlwaysOnMonitor(%d): %s got the connection" \
                                   % (self._cluster_id, name)) 
             if connection:
                 check_ip = False
-                _logger.debug("AlwaysOnMonitor(%d): 2014 %s try to get health info " \
+                _logger.debug("AlwaysOnMonitor(%d): %s try to get health info " \
                                   % (self._cluster_id, name)) 
                 health_status_info = self._get_health_info_servers(connection)
-                _logger.debug("AlwaysOnMonitor(%d): 2014 %s got the health info %s" \
+                _logger.debug("AlwaysOnMonitor(%d): %s got the health info %s" \
                                   % (self._cluster_id, name, health_status_info)) 
                 if health_status_info:
                     for server_ip, values in health_status_info.iteritems():
                         if server_ip == ip:
-                            _logger.info("AlwaysOnMonitor(%d): 2014 %s set the new health values %s"  
+                            _logger.info("AlwaysOnMonitor(%d): %s set the new health values %s"  
                                            % (self._cluster_id, name, values)) 
                             server_info["new_health_info"] = values
                             check_ip = True
                             break
                     if not check_ip:
-                       _logger.debug("AlwaysOnMonitor(%d): 2014: %s Could not found IP in response %s" \
+                       _logger.debug("AlwaysOnMonitor(%d): %s Could not found IP in response %s" \
                                     % (self._cluster_id, name, health_status_info))
                 else:
-                    _logger.debug("AlwaysOnMonitor(%d):2014: %s Empty response from health setting 0,0,3" \
+                    _logger.debug("AlwaysOnMonitor(%d): %s Empty response from health query setting server OFFLINE" \
                                   % (self._cluster_id, name))
                     server_info["new_health_info"] = [0, 0, 3]
             else:        
-                _logger.error("AlwaysOnMonitor(%d):2014: %s Connection Not found while connecting secondry setting 0,0,4" \
+                _logger.error("AlwaysOnMonitor(%d): %s Connection Not found while connecting secondry setting server FAILED" \
                               % (self._cluster_id, name))
                 server_info["new_health_info"] = [0, 0, 4]
-            _logger.info("AlwaysOnMonitor(%d):2014: %s putting into the queue %s" \
+            _logger.info("AlwaysOnMonitor(%d): %s putting into the queue %s" \
                                    %(self._cluster_id, name, server_info))
-            self.queue.put_nowait(server_info)
+            self.health_queue.put_nowait(server_info)
         except Exception, ex:
-            _logger.error("AlwaysOnMonitor(%d):2014: %s Exception while Health check %s put empty dict" \
+            _logger.error("AlwaysOnMonitor(%d): %s Exception while Health check %s put empty dict" \
                          % (self._cluster_id, name, ex)) 
-            self.queue.put_nowait({})
+            self.health_queue.put_nowait({})
 
     def stop_threads(self):
         ''' Stop all the greenlets
@@ -1777,7 +1868,7 @@ class AlwaysOnMonitorDaemon(daemon.Daemon):
                             os.remove(marker_file)
                         except:
                             _logger.error("AlwaysOnParent: Error on deleting marker file")
-
+    
     def run(self):
         try:
             self._register_signal_handler()
@@ -1794,6 +1885,17 @@ class AlwaysOnMonitorDaemon(daemon.Daemon):
                             "does not exist " % (os.getpid(),))
             time.sleep(1)
 
+        sleep_interval = 5
+
+        # try to determine the api_key
+        while True:
+            global APIKEY
+            APIKEY = util.get_apikey(GLOBAL_LB_SQLITE_FILE)
+            if APIKEY != '':
+                break
+            _logger.error("AlwaysOnParent(%d): Failed to determine apikey." % (os.getpid(),))
+            time.sleep(sleep_interval)
+
         while True:
             try:
                 # cleanup any finished children
@@ -1803,6 +1905,11 @@ class AlwaysOnMonitorDaemon(daemon.Daemon):
                 # monitor process for it.
                 #
                 self.spwan_monitor_children()
+                
+                if not os.path.exists("/var/run/always_on_monitor.pid"):
+                    _logger.warn("Always On Monitor PID file is not Present Exiting Now")
+                    break
+
             except Exception, ex:
                 _logger.error("AlwaysOnMonitorDaemon run failed: %s" % ex)
                 _logger.error("%s" % (traceback.format_exc(),))
