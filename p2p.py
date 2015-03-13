@@ -5,33 +5,21 @@ import os
 import socket
 from idb import log  
 import traceback
-import sqlite3
 from idb.cluster_util import PasswordUtils
 import urllib, urllib2
 import httplib
 import time
 import pyodbc
 from datetime import datetime
-# #############################
+
+########### Script Constants ##################
+SCALEARC_IP_ADDRESS = "127.0.0.1"
+
+MAX_RETRY = 3
 CONN_RETRY = 3
 SOCKET_TIMEOUT = 1
-mssql_login_timeout = 10
-mssql_query_timeout = 5
-
-# Global related to SSL
-CLIENT_CERT_PATH = '/system/certs/cid_%s/client.pem'
-CLIENT_KEY_PATH = '/system/certs/cid_%s/client.key'
-CA_CERT_PATH = '/system/certs/cid_%s/server-ca.pem'
-
-
-#initialize logging
-log.set_logging_prefix("failover")
-_logger = log.get_logger("failover")
-
-# Sqlite file
-GLOBAL_LB_DB_FILE = "/system/lb.sqlite"
-LB_DB_FILE = "/system/lb_%s.sqlite"
-
+MSSQL_LOGIN_TIMEOUT = 10
+MSSQL_QUERY_TIMEOUT = 5
 # server health definitions
 SERVER_DOWN = 0
 SERVER_LAGGING = 1
@@ -44,8 +32,6 @@ WRITE_ONLY = 2 # not in use, reserved for future use.
 STANDBY_TRAFFIC = 3
 STANDBY_NO_TRAFFIC = 4
 
-APIKEY = ""
-MAX_RETRY = 3
 # role mappings
 SERVER_ROLE_MAP = {}
 SERVER_ROLE_MAP['Read + Write'] = READ_WRITE
@@ -62,7 +48,19 @@ REVERSE_SERVER_ROLE_MAP[WRITE_ONLY] = 'Write'
 REVERSE_SERVER_ROLE_MAP[STANDBY_TRAFFIC] = 'Standby + Read'
 REVERSE_SERVER_ROLE_MAP[STANDBY_NO_TRAFFIC] = 'Standby, No Traffic'
 
-message = []
+#initialize logging
+log.set_logging_prefix("failover")
+_logger = log.get_logger("failover")
+
+# UI event message and their code
+events_error_code = { "replication_error":74,
+             "failover_error":75,
+             "mark_offline":80,
+           }
+
+# GLobal Variable
+APIKEY = ""
+###############################################
 
 class LoggerClass(object):
     ''' Customized class for logging
@@ -94,45 +92,46 @@ class ProcessFailover(object):
     '''
     
     def __init__(self, cluster_stats):
+        self._root_accnt_info = {}
         self._cluster_stats = json.loads(cluster_stats)
         self._logger = LoggerClass()
         self._parse_cluster_stats()
-        self._base_url = 'https://127.0.0.1/api/'
+        self._ip_address = SCALEARC_IP_ADDRESS
+        self._base_url = 'https://%s/api/' % self._ip_address
         self._api_max_retry = 3        
         self._api_sub_url = '?apikey=' + APIKEY
         self._server_to_be_promoted = {} # {'server_id':n, 'server_role':''}
         self._server_to_be_demoted = {}
-        self._switch_delay_time = 5
         self._wait_for_sync = True
         self._max_wait_sync_retry = 3
         self._wait_sync_retry_interval = 1 
         self._force_failover = True 
-    @classmethod 
-    def get_sqlite_handle(cls, db_name, _logger, timeout=5.0):
-        '''
-        Returns a sqlite handle to the recieved db_name
-        '''
-        try:
-            if timeout:
-                conn = sqlite3.connect(db_name, timeout=timeout)
-            else:
-                conn = sqlite3.connect(db_name)
-            # obtain all results as python dictionaries
-            conn.row_factory = sqlite3.Row
-            return conn
-        except Exception, ex:
-            _logger.info("Exception in reading sqlite data ex %s" %ex)
-            return None
+        self._error_msg = ""
+        self._alert_msg = ""
+        self._abort_failover = False
+        self.mark_offline = {}
+        self.events = None
 
-    @classmethod
-    def close_sqlite_resources(cls, sqlite_handle, cursor, _logger):
+    def is_replication_enabled(self, cluster_id, _logger):
+        '''
+        Check and return true if replication is enabled for this cluster
+        otherwise return False.
+        '''
+        is_rep_enable = False
         try:
-            if cursor:
-                cursor.close()
-            if sqlite_handle:
-                sqlite_handle.close()
+            data_dict = {}
+            master_base_url_path = '/api/cluster/%s/replication_enabled?apikey=%s' %(cluster_id, APIKEY)
+            res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'GET')
+            if res['message'].find('ERROR:') >= 0 or (not res['success']):
+                self._logger.error("Something went wrong while fetching replication enable flag " \
+                                    "from server: %s" % (res['message']))
+                return 
+            is_rep_enable = res["data"]["replication_enabled"]
+            if is_rep_enable == "on":
+                return True
         except Exception, ex:
-            _logger.info("Exception in closing sqlite data ex %s" %ex)
+            _logger.error("Error Occured while getting replication enable check %s" %ex)
+        return True 
 
     def _get_json_formatted_reply_from_url(self, url):
         '''
@@ -158,39 +157,6 @@ class ProcessFailover(object):
                               % (url, ex))
                     return None
 
-    def find_ssl_info_from_sqlite(self):
-        '''
-        return outbound ipadress of this cluster
-        '''
-        ssl_enabled = False
-        ssl_enable_client = False
-        ssl_verify_server = False
-        out_ip = ''
-        retry = 0
-        query = "select backendip,ssl_enabled,ssl_enable_client,ssl_verify_server from lb_clusters where status = 1;"
-        sqlite_handle = ProcessFailover.get_sqlite_handle(LB_DB_FILE % self.cluster_id, self._logger)
-        if sqlite_handle:
-            db_cursor = sqlite_handle.cursor()
-            while retry < MAX_RETRY:
-                try:
-                    db_cursor.execute(query)
-                    row = db_cursor.fetchone()
-                    if row:
-                        out_ip = row['backendip']
-                        ssl_enabled = True if int(row['ssl_enabled']) else False
-                        ssl_enable_client = True if int(row['ssl_enable_client']) else False
-                        ssl_verify_server = True if int(row['ssl_verify_server']) else False
-                    break
-                except (Exception, sqlite3.Error) as e:
-                    retry = retry + 1
-                    if retry >= MAX_RETRY:
-                        _logger.error("Failed to find cluster info: %s" % (e))
-                    else:
-                        time.sleep(0.1)
-
-            ProcessFailover.close_sqlite_resources(sqlite_handle, db_cursor, self._logger)
-        return ssl_enabled, ssl_enable_client, ssl_verify_server, out_ip
-                                                 
     def _parse_cluster_stats(self):
         '''Function to read only cluster information from /cluster api
         '''
@@ -227,11 +193,11 @@ class ProcessFailover(object):
         self.cluster_name = self._cluster_stats["data"]['cluster_name']
         self.cluster_started = True if self._cluster_stats["data"]['cluster_started'] == "yes" else False
 
-        # Read root user info related to ssl and username and password
         self._servers_list = []
         
-        # Read root user info related to ssl and username and password
-        self.get_root_user_info()
+        # Read root user info username and password
+        self._root_accnt_info['username'] = self._cluster_stats["username"]
+        self._root_accnt_info['password'] = self._cluster_stats["password"]
 
         for item in self._cluster_stats['data']['cluster_servers']:
             d = {}
@@ -245,71 +211,6 @@ class ProcessFailover(object):
             d['password'] = self._root_accnt_info.get('password', '')
             self._servers_list.append(d.copy())
         return True
-
-    def get_root_user_info(self):
-        ''' Reading User Information regarding ssl and username and password
-        '''
-        self._logger.info("Failover: Reading root User info and ssl info")
-        self._root_accnt_info = self.find_root_user_info()
-        self._ssl_enabled, self._ssl_enable_client,\
-        self._ssl_verify_server, self.outbound_ip = self.find_ssl_info_from_sqlite()
-        self._ssl_components = {'cert': CLIENT_CERT_PATH % self.cluster_id,
-                                 'key': CLIENT_KEY_PATH % self.cluster_id,
-                                 'ca': CA_CERT_PATH % self.cluster_id,
-                                 'cipher': 'ALL'}
-        self.ssl = self._get_ssl_info()
-
-    def find_root_user_info(self):
-        '''
-        Return a dictionary containing  root account information from table
-        lb_users for this cluster_id.
-        '''
-        root_accnt_info = {'username':'', 'password':''}
-        dbname = LB_DB_FILE % self.cluster_id
-        sqlite_handle = ProcessFailover.get_sqlite_handle(dbname, self._logger)
-        if not sqlite_handle:
-            return root_accnt_info
-
-        db_cursor = sqlite_handle.cursor()
-        query = "select username, encpassword from lb_users where type = 1 " \
-                "and status=1"
-
-        retry = 0
-        while retry < MAX_RETRY:
-            try:
-                db_cursor.execute(query)
-                row = db_cursor.fetchone()
-                if row:
-                    root_accnt_info['username'] = row['username']
-                    root_accnt_info['password'] = row['encpassword']
-                break
-            except Exception, ex:
-                retry = retry + 1
-                if retry >= MAX_RETRY:
-                    self._logger.error("Failed to find root user info for cluster %s" % (ex))
-                else:
-                    time.sleep(0.1)
-
-        ProcessFailover.close_sqlite_resources(sqlite_handle, db_cursor, _logger)
-        if retry >= MAX_RETRY:
-            return root_accnt_info
-
-        #lets decrypt this password
-        root_accnt_info['password'] = PasswordUtils.decrypt(root_accnt_info['password'])
-        return root_accnt_info
-    
-    def _get_ssl_info(self):
-        if self._ssl_enabled:
-            if not self._ssl_verify_server:
-                self._ssl_components['ca'] = None
-
-            if not self._ssl_enable_client:
-                self._ssl_components['key'] = None
-                self._ssl_components['cert'] = None
-
-            return self._ssl_components
-        else:
-            return None
 
     def _find_server_to_be_promoted(self):
         '''
@@ -594,37 +495,26 @@ class ProcessFailover(object):
                 return item['server_role']
         return -1
 
-    @classmethod    
-    def get_apikey(cls, db_name = '/system/lb.sqlite', _logger=None,  max_retry = 10):
-        """This function will be used to get apikey from sqlite table
+    def get_apikey(self, _logger=None):
+        """This function will be used to get apikey
         """
         apikey = None
         try:
-            sqlite_handle = cls.get_sqlite_handle(db_name, _logger)
-        
-            if sqlite_handle:
-                db_cursor = sqlite_handle.cursor()
-                #Query to get apikey from lb_network table
-                query_for_apikey = "select apikey from lb_network"
-           
-                retry = 0
-                while retry < max_retry:
-                    try:
-                        db_cursor.execute(query_for_apikey)
-                        row = db_cursor.fetchone()
-                        if row:
-                            apikey = row['apikey']
-                        break
-                    except (Exception, sqlite3.Error) as ex:
-                        retry = retry + 1
-                        if retry >= max_retry:
-                            _logger.error("Failed to get apikey %s" % ex)
-                        else:
-                            time.sleep(0.1)
+            master_base_url_path = '/api/system/show_api_key'
+            data_dict = {}
+            data_dict["apikey"] = "show_api_key"
+            data_dict["username"] = "root"
+            data_dict["password"] = "admin"
+            res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'POST')
+            if res['message'].find('ERROR:') >= 0 or (not res['success']):
+                self._logger.error("Something went wrong while fetching apikey " \
+                                    "from server: %s" % (res['message']))
+                return 
+            apikey = res["data"]["apikey"]
         except Exception, ex:
+            self._error_msg = "Error Occured while getting apikey"
             _logger.error("Error Occured while getting apikey %s" % ex)
         finally:
-            cls.close_sqlite_resources(sqlite_handle, db_cursor, _logger)
             return apikey
 
     def _refresh_servers_info(self):
@@ -679,6 +569,7 @@ class ProcessFailover(object):
         '''
         if self._origin == 'idbcore':
             if not self._is_wait_for_failure_timeout():
+                self._error_msg = 'Error while doing failure timeout.'
                 self._logger.error("Error while doing failure timeout")
                 return False
         else:
@@ -686,15 +577,23 @@ class ProcessFailover(object):
                               " failure timeout" % (self._origin))
 
         if not self._is_cluster_up():
+            self._error_msg = 'Cluster is marked down.'
             self._logger.error("Cluster is marked down.")
             return False
 
         if not self._is_single_master_up():
+            self._error_msg = 'Master server(s) is/are present.'
             self._logger.error("Master server(s) is/are present.")
             return False
         
         if not self._is_standby_server_present():
+            self._error_msg = 'No valid standby server present'
             self._logger.error("No valid standby server present.")
+            return False
+
+        if self._origin == "gui" and not self.is_replication_enabled(self.cluster_id, self._logger): 
+            self._error_msg = "Replication Monitoring should be ON in Manual Failover."
+            self._logger.error("Replicaiton monitoring for cluster has been disabled.")
             return False
 
         return True
@@ -780,14 +679,12 @@ class ProcessFailover(object):
         return None, None
 
     def _do_demotion(self):
-
-        ip_addr = '127.0.0.1'
         master_base_url_path = '/api/cluster/' + str(self.cluster_id) + '/server_role/' + str(self._server_to_be_demoted['server_id'])
         data_dict = {}
         data_dict["apikey"] = APIKEY
         data_dict["server_role"] = REVERSE_SERVER_ROLE_MAP[self._server_to_be_promoted['server_role']]
         data_dict["failover_timeout"] = self._failover_timeout
-        res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'PUT')
+        res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'PUT')
         return res
 
     def _exec_url_generic(self, ip_addr, base_url_path, data_dict, method='PUT'):
@@ -811,8 +708,6 @@ class ProcessFailover(object):
         By now we have found server to be promoted and server to be demoted.
         Make api calls to finalize the changes.
         '''
-        ip_addr = '127.0.0.1'
-
         self._logger.debug("Server to be demoted: %s" % (self._server_to_be_demoted))
         self._logger.debug("Server to be promoted: %s" % (self._server_to_be_promoted))
         # first demotion
@@ -828,8 +723,10 @@ class ProcessFailover(object):
                 self._logger.error("Something went wrong while demoting " \
                               "server: %s" % (res['message']))
                 self._logger.error("Demotion is failed and message is %s " %res['message'])
+                self._error_msg = res['message']
                 return False
-            self._logger.debug("Demotion logs: %s" % (res))
+
+            self._logger.info("Demotion logs: %s" % (res))
 
             #
             # sleep for core failover timeout. After this time interval process 
@@ -881,7 +778,7 @@ class ProcessFailover(object):
         retry = 0
         while retry < MAX_RETRY:
             try:
-                res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'PUT')
+                res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'PUT')
                 if res['message'].find('ERROR:') >= 0 or (not res['success']):
                     self._logger.error("Something went wrong while promoting"\
                                     " of servers: %s" % (res['message']))
@@ -903,8 +800,6 @@ class ProcessFailover(object):
             self._revert_previous_demotion()
             return False
 
-        #self._send_failover_alert()
-
         return True
     
     def _revert_previous_demotion(self):
@@ -918,7 +813,6 @@ class ProcessFailover(object):
             # other API.
             #
             time.sleep(1)
-            ip_addr = '127.0.0.1'
             self._logger.warn("Reverting demotion of last stage.")
             self._logger.debug("Attempting to restore server state: %d with role: %s" \
                           % (self._server_to_be_demoted['server_id'], \
@@ -928,7 +822,7 @@ class ProcessFailover(object):
             data_dict = {}
             data_dict["apikey"] = APIKEY
             data_dict["server_role"] = REVERSE_SERVER_ROLE_MAP[self._server_to_be_demoted['server_role']]
-            res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'PUT')
+            res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'PUT')
 
             if res['message'].find('ERROR:') >= 0 or (not res['success']):
                 self._logger.error(" Something went wrong while restoring " \
@@ -946,7 +840,6 @@ class ProcessFailover(object):
         # other API.
         #
         time.sleep(1)
-        ip_addr = '127.0.0.1'
         self._logger.warn("Reverting promotion of last stage.")
         self._logger.debug("Attempting to restore server state: %d with role: %s" \
                       % (self._server_to_be_promoted['server_id'], \
@@ -955,7 +848,7 @@ class ProcessFailover(object):
         data_dict = {}
         data_dict["apikey"] = APIKEY
         data_dict["server_role"] = REVERSE_SERVER_ROLE_MAP[self._server_to_be_promoted['server_role']]
-        res = self._exec_url_generic(ip_addr, master_base_url_path, json.dumps(data_dict), 'PUT')
+        res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'PUT')
         if res['message'].find('ERROR:') >= 0 or (not res['success']):
             self._logger.error("Something went wrong while restoring " \
                                 "server state: %s" % (res['message']))
@@ -971,7 +864,7 @@ class ProcessFailover(object):
             server['lagtime'] = self._get_lagtime_of_server(server['server_id'],
                                                             lagtime_list)
             server_ip, server_port = self._get_ip_port_of_server(server['server_id'])
-            if server['lagtime'] == 0 and server_ip in new_promoted_server:
+            if server['lagtime'] == 0 and server_ip in new_promoted_servers:
                 zero_lagtime = True
                 new_server_id = server['server_id']
         #
@@ -1002,6 +895,8 @@ class ProcessFailover(object):
                 self._logger.debug("Servers lagtime list is %s" \
                                    % (lagtime_list))
                 do_wait, new_server_id = self._is_wait_retry_required(lagtime_list, new_promoted_servers)
+                self._logger.info("Wait retry required output is: new_server_id %s and do_wait %s"\
+                                  %(new_server_id, do_wait))
                 if do_wait:
                     self._logger.info("Wait for sync no more required." \
                                         " Breaking from loop.")
@@ -1014,8 +909,8 @@ class ProcessFailover(object):
             if self._zero_lagtime_server and new_server_id > 0:
                 self._logger.info("Zero lag time server found whose id is %s" %new_server_id)
                 server_id, abort_failover = new_server_id, False
-           
             elif self._force_failover:
+                self._logger.info("Could not find zero lag time server now trying force failover")
                 server_id, abort_failover = self._find_lowest_lagged_server()
                 server_ip, server_port = self._get_ip_port_of_server(server_id)
                 if server_ip not in new_promoted_servers:
@@ -1071,15 +966,44 @@ class ProcessFailover(object):
                     self._logger.error("Something went wrong while demoting " \
                                   "server: %s" % (res['message']))
                     return False
+        return True
 
+    def _change_mark_server_status(self, server_ip, online=False):
+        retry = 0
+        while retry < MAX_RETRY:
+            try:
+                master_base_url_path = '/api/cluster/%s/server/%s/mark_server_status' % (str(self.cluster_id),
+                                                    str(self._server_to_be_demoted['server_id']))
+
+                data_dict = {}
+                data_dict["apikey"] = APIKEY
+                data_dict["mark_server_status"] = 'offline' if not online else 'online'
+                data_dict["timetowait"] = 0
+
+                res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(data_dict), 'PUT')
+                self._logger.info("Response of marking server offline %s: %s" % (server_ip, res))
+                if res['message'].find('ERROR:') >= 0 or (not res['success']):
+                    self._logger.error("Something went wrong while marking server "\
+                                    " offline: %s" % (res['message']))
+                    retry += 1
+                    time.sleep(0.5)
+                else:
+                    self._logger.info("Sucessfully changes server %s mark server status" % server_ip)
+                    self.send_alert("mark_offline", server_ip=server_ip)
+                    break
+            except Exception, ex:
+                self._logger.error("Got an error %s while marking server %s offline. Retrying ..." % (ex, server_ip))
+                retry += 1
+                time.sleep(0.5)
+
+        if retry >= MAX_RETRY:
+            self._logger.error("Failed to marke Server %s offline after all retry attempts." % (server_ip))
  
     def _process_async_replication(self):
         '''
         In case of replication set to Asynchronus we have more things to do
         before we promote master. We do those here.
         '''
-        self._logger.info("Waiting for Switch delay time that is %s" %self._switch_delay_time)
-        time.sleep(self._switch_delay_time)
         self._logger.info("MSSQL replication checks started...")
         old_server_ip, old_server_port = self._get_ip_port_of_server(self._server_to_be_demoted['server_id'])
         new_server_ip, new_server_port = self._get_ip_port_of_server(self._server_to_be_promoted['server_id'])
@@ -1088,79 +1012,73 @@ class ProcessFailover(object):
                                              '%s:%s' % (new_server_ip, new_server_port),
                                              self._servers_list, self._root_accnt_info,
                                              self._wait_for_sync, self._max_wait_sync_retry,
-                                             self._wait_sync_retry_interval, self._force_failover,
+                                             self._wait_sync_retry_interval, self._force_failover, self._origin,
                                              log=self._logger)
-        success, abort_failover, error_msg, new_promoted_list = self.trans_p2p_failover.do_failover() 
+        success, abort_failover, error_msg, new_promoted_list = self.trans_p2p_failover.detect_topology() 
         
-        if abort_failover:
-            self._logger.error("Error occured while changing replication %s" % error_msg)
-            return False
-
-        self.do_wait_for_sync(new_promoted_list)
-
         # If there is any error_msg that will raised as an event as well mail alert will be sent
         if error_msg:
-            error_msg = 'Cluster %s, %s' % (self._cluster_stats['data']['cluster_name'], error_msg)
-            self._logger.error(error_msg)
-            #self.send_alert("replication_error", error_message=error_msg,)
+            self._error_msg = 'Cluster %s, %s' % (self._cluster_stats['data']['cluster_name'], error_msg)
+            self._logger.error(self._error_msg)
+            self.send_alert("replication_error", error_message=error_msg,)
+
         # If abort failover is triggered we need to revert back to older older state.
+        if abort_failover:
+            msg = "Aborting Failover as error occured while changing Detecting Active-Active Replication: %s" %error_msg
+            self._logger.error(msg)
+            return False
+
+        if not self.do_wait_for_sync(new_promoted_list):
+            return False
+
         return True
 
-class ConnectionData(object):
-    ''' Helper Class to make connection either from sqlite or sql server
-    '''
-    @staticmethod
-    def get_connection_string(server_ip, server_port, root_account):
-        return "DRIVER={FreeTDS};SERVER=%s;PORT=%s;UID=%s;PWD=%s;TDS_VERSION=8.0;" \
-                    % (server_ip, str(server_port), root_account['username'], root_account['password'])
+    def find_server_for_marking_offline(self):
+        ''' Find the server for marking offline
+            This is for Autofailover case only
+        '''
+        mark_offline = {} 
+        if self._origin == 'idbcore' and self._server_to_be_demoted.get('server_id'):
+            for server in self._servers_list:
+                if server['server_id'] == self._server_to_be_demoted.get('server_id') and \
+                                          server['server_status'] == SERVER_HEALTHY and \
+                                          server['server_role'] == READ_WRITE and \
+                                          server['mark_server_status'] == 'online':
+                    mark_offline[server['server_ip']] = "Mark the Server Offline"     
+        
+        return mark_offline
 
-    @staticmethod
-    def get_sqlserver_connection(server_ip, port, conn_str, _logger, max_retry=CONN_RETRY):
-        retry = 0
-        conn = None
-        while retry < max_retry:
-            try:
-                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                test_socket.settimeout(SOCKET_TIMEOUT)
-                test_socket.connect((server_ip, port))
-            except socket.error:
-                errno, errstr = sys.exc_info()[:2]
-                if errno == socket.timeout:
-                    _logger.error("Timeout has occured %s " % (errstr))
-                else:
-                    _logger.error("Error occured while creating socket connections %s " % (errstr))
-                retry = retry + 1
-                if retry >= max_retry:
-                    _logger.error("In Socket Failed to make connection with socket " \
-                                  "Max retry limit reached:" )
-                    return conn
-                else:
-                    _logger.error("Retrying for socket connection ")
-                    continue
-            except Exception, ex:
-                _logger.info("Some Exception While using socket %s" % (ex))
-                retry = retry + 1
-                if retry >= max_retry:
-                    _logger.error("In Exception Failed to make connection with socket " \
-                                  "Max retry limit reached:")
-                    return conn
-                else:
-                    _logger.error("Retrying for socket connection ")
-            finally:
-                if test_socket:
-                    test_socket.close()
- 
-            try:
-                conn = pyodbc.connect(conn_str, autocommit=True, timeout=mssql_login_timeout)
-                break
-            except Exception, ex:
-                retry = retry + 1
-                _logger.info("Was Not Able To Connect : %s" %ex)
-        if conn:
-            _logger.debug("setting query timeout to %s for ip %s"
-                              % (mssql_query_timeout, server_ip))
-            conn.timeout = mssql_query_timeout
-        return conn
+    def send_alert(self, msg_header, server_ip=None, server_id=0, error_message=None):
+        ''' Send alert to alert_engine service
+        '''
+        msg = {'ident': self.cluster_id, 'cid': self.cluster_id, 'subject': 'Failover', 'message': ''}
+        msg_dict = {
+                   "mark_offline": "Sucessfully mark server %s status offline for cluster id %s " % (server_ip, self.cluster_id), 
+                   "replication_error": error_message,
+                   "failover_error": 'Failover for Cluster %s failed, %s' % (self._cluster_stats['data']['cluster_name'], error_message)
+                   }
+        
+        message = msg_dict[msg_header]
+        result = self.send_event(message, int(msg_header), clusterid=self.cluster_id, serverid=server_id)
+        self._logger.info("Response from API for sending events %s" % (result))
+
+    def send_event(self, message, event_header, priority = '1', clusterid='', serverid=0):
+        """This method will be used to send the events
+            :param message: message to be send in the event_type.
+            :param event_type: Event type eg 11.
+            :param priority: Priority of the event to be send.
+
+        """
+        event_type = events_error_code[event_header]
+        args_dict = dict(apikey = APIKEY,
+                            message = message,
+                            type = event_type,
+                            clusterid=clusterid,
+                            serverid=serverid,
+                            priority = priority)
+        master_base_url_path = '/api/events'
+        res = self._exec_url_generic(self._ip_address, master_base_url_path, json.dumps(args_dict), 'POST')
+        return res
 
 class transaction_peer2peer_autofailover(object):
     '''
@@ -1169,7 +1087,9 @@ class transaction_peer2peer_autofailover(object):
     '''
     
     def __init__(self, cluster_id, old_master, new_master, servers_list, root_accnt_info,\
-                 wait_for_sync, max_wait_sync_retry, wait_sync_retry_interval, force_failover, log=None):
+                 wait_for_sync, max_wait_sync_retry, wait_sync_retry_interval, force_failover, origin, log=None):
+        ''' Initialize the vaiables
+        '''
         self.old_master_ip, self.old_master_port = old_master.split(":")
         self.new_master_ip, self.new_master_port = new_master.split(":")
         self.servers_list = servers_list
@@ -1181,6 +1101,7 @@ class transaction_peer2peer_autofailover(object):
         self.server_ip_name_mapping = {}
         self.server_name_ip_mapping = {}
         self.server_name_publication_info = {}
+        self._origin = origin
         self._logger = log
 
     def get_servers_publishers_info(self):
@@ -1192,92 +1113,124 @@ class transaction_peer2peer_autofailover(object):
                         'subscriber': [],
                        }
         for server in self.servers_list:
-            server_name = ''
-            publisher = ''
-            publication = ''
-            publisher_db = ''
-            subscriber_list = []
-            conn = self._create_connection(server)
-            if not conn:
-                self.server_name_publication_info[server['server_ip']] = servers_info 
-                continue
-            cursor = conn.cursor()
-            # select database
-            query1 = "use distribution;"
-            cursor.execute(query1)
+            try:
+                conn = cursor = None
+                conn = self._create_connection(server)
+                if not conn:
+                    self.server_name_publication_info[server['server_ip']] = servers_info 
+                    continue
 
-            #select servername
-            query2 = "select @@SERVERNAME as servername;"
-            cursor.execute(query2)
+                cursor = conn.cursor()
+                # select database
+                query = "use distribution;"
+                cursor.execute(query)
+            
+                #select servername
+                server_name = self.find_server_name(cursor)
+                self._logger.info("Result of the query for servername is %s" %server_name)
+                if not server_name:
+                    self.server_name_publication_info[server['server_ip']] = servers_info 
+                    continue
+                self.server_name_ip_mapping[server_name] = server['server_ip']
+            
+                # select publisher name
+                publisher = self.find_publisher_name(cursor)
+                self._logger.info("Result of the query for publishername is %s" %publisher)
+                if not publisher:
+                    self.server_name_publication_info[server['server_ip']] = servers_info 
+                    continue
+            
+                #select publisher_db name and publication name
+                publisher_db, publication = self.find_publisher_db_name(cursor, publisher)
+                self._logger.info("Result of the query for publisherdb and publication is %s, %s" %(publisher_db, publication))
+                if not publisher_db or  not publication:
+                    self.server_name_publication_info[server['server_ip']] = servers_info 
+                    continue
+            
+                # select subscribers names
+                subscriber_list = self.get_subscriber_list(cursor, publisher, publisher_db, publication)
+                self._logger.info("Result of the query for subscriber_list is %s" %subscriber_list)
+                if not subscriber_list:
+                    self.server_name_publication_info[server['server_ip']] = servers_info 
+                    continue
+            
+                self.server_name_publication_info[server['server_ip']] = {'server_name': server_name,
+                                                                  'publisher':publisher,
+                                                                  'publication': publication,
+                                                                  'publisher_db': publisher_db,
+                                                                  'subscriber':subscriber_list,
+                                                                 }
+            except Exception, ex:
+                self._logger.error("Exception while fetching publishers and subscribers info for serverip %s and exception is %s"\
+                                   %(server['server_ip'], ex)) 
+            finally: 
+                self.close_connection(cursor, conn)
+   
+
+    def get_subscriber_list(self, cursor, publisher, publisher_db, publication):
+        # Get subscriber list
+        try: 
+            subscriber_list = []
+            query = "exec sp_replmonitorhelpsubscription @publisher= '%s', \
+                 @publisher_db = '%s', @publication = '%s',\
+                 @publication_type = 0;" %(publisher, publisher_db, publication)
+            self._logger.info("Query executed for subscriber list %s" %query)
+            cursor.execute(query)
+            for subscriber_info in cursor.fetchall():
+                subscriber_list.append(subscriber_info[2])
+        except Exception, ex:
+            self._logger.error("Exception while calculating subscriber list %s" %ex)
+        return subscriber_list
+
+    def find_server_name(self, cursor):
+        #select servername
+        try:
+            server_name = ''
+            query = "select @@SERVERNAME as servername;"
+            self._logger.info("Query executed for servername %s" %query)
+            cursor.execute(query)
             for name in cursor.fetchone():
                 server_name = name
-                self.server_name_ip_mapping[server_name] = server['server_ip']
-            # select publisher name
-            query3 = "exec sp_replmonitorhelppublisher;"
-            cursor.execute(query3)
-            for pub, distribution_db, status, warning, publication_count, returnstamp in cursor.fetchall():
-                publisher = pub
-            #select publisher_db name and publication name
-            query4 = "exec sp_replmonitorhelppublication @publisher='%s'" %publisher 
-            cursor.execute(query4)
+        except Exception, ex:
+            self._logger.error("Exception while calculating server name %s" %ex)
+        return server_name
+
+    def find_publisher_name(self, cursor):
+        # Find Publisher name
+        try:
+            publisher = ''
+            query = "exec sp_replmonitorhelppublisher;"
+            self._logger.info("Query executed for publisher name %s" %query)
+            cursor.execute(query)
+            for pubs_info in cursor.fetchall():
+                publisher = pubs_info[0]
+        except Exception, ex:
+            self._logger.error("Exception while calculating publisher name %s" %ex)
+        return publisher
+
+    def find_publisher_db_name(self, cursor, publisher):
+        # Find out publisher db and publication name
+        try:
+            publisher_db = ''
+            publication = ''    
+            query = "exec sp_replmonitorhelppublication @publisher='%s'" %publisher 
+            self._logger.info("Query executed for publisher db and publication %s" %query)
+            cursor.execute(query)
             for publication_info in cursor.fetchall():
                 publisher_db = publication_info[0]
                 publication = publication_info[1]
-            
-            # select subscribers names
-            query5 = "exec sp_replmonitorhelpsubscription @publisher= '%s', \
-                 @publisher_db = '%s', @publication = '%s',\
-                 @publication_type = 0;" %(publisher, publisher_db, publication)
-            cursor.execute(query5)
-            for subscriber_info in cursor.fetchall():
-                subscriber_list.append(subscriber_info[2])
-           
-            self.server_name_publication_info[server['server_ip']] = {'server_name': server_name,
-                                                              'publisher':publisher,
-                                                              'publication': publication,
-                                                              'publisher_db': publisher_db,
-                                                              'subscriber':subscriber_list,
-                                                             }
-            self.close_connection(cursor, conn)
-    
+        except Exception, ex: 
+            self._logger.error("Exception while calculating publisher db and publication name %s" %ex)
+        return publisher_db, publication
+
     def close_connection(self, cursor, connection):
-        if cursor:
-            cursor.close()
-        if connection:
-            connection.close()
-
-    def execute_query(self, cursor, query):
         try:
-            self._logger.info("Query to be executed is %s" %query)
-            cursor.execute(query)
+            if cursor:
+                cursor.close()
+            if connection:
+                connection.close()
         except Exception, ex:
-            self._logger.error("Exception in query execution %s" %ex)
- 
-    def find_topology(self):
-        # Detect topology
-        all_server_name = self.server_name_ip_mapping.keys()
-        all_the_server_master = True
-        for server in self.servers_list:
-            subscriber_list = self.server_name_publication_info[server['server_ip']]['subscriber']
-            server_name = self.server_name_publication_info[server['server_ip']]['server_name']
-            if not subscriber_list or server['server_status'] != SERVER_HEALTHY:
-                self._logger.info("Either subscriber list %s is empty or server status %s is not healthy"\
-                                  %(subscriber_list, server['server_status']))
-                self._logger.info("Ignoring this server %s" %server_name)
-                continue
-
-            is_present = True#self.is_server_in_subscriber_sublist(server_name, subscriber_list)
-            self._logger.info("Server name %s present in subscriber's subscriber list %s is %s"\
-                              %(server_name, subscriber_list, is_present))
-            if not is_present:
-                self._logger.info("All the server are not master")
-                all_the_server_master = False
-        if all_the_server_master:
-            self._logger.info("All the server are master so topology is MM")
-            return "MM"
-        else:
-            self._logger.info("All the server are not masters so topology is MS")
-            return "MS"
+            self._logger.error("Exception while closing cursor and connection %s"%ex)
 
     def find_new_promoted_server(self, old_server_name, old_sublist):
         self._logger.info("Finding Server Name %s in Subscribe list of sublist %s" \
@@ -1299,7 +1252,6 @@ class transaction_peer2peer_autofailover(object):
                     # Select that server for promotion
                     self._logger.info("Old Server Name %s is present in the sublist of server_name %s"\
                                       %(old_server_name, server_name))
-                    server_ip = self.server_name_ip_mapping[server_name]
                     new_list.append(server_ip)
                     continue
                 else:
@@ -1311,52 +1263,147 @@ class transaction_peer2peer_autofailover(object):
                 self._logger.info("Subscriber list is empty for the server %s" %server_name)
         return new_list
 
-    def do_failover(self):
-        success = False
+    def find_new_server_from_publisher_info(self, old_master_server_name):
+        ''' Find out all the servers whom replication towards old_master server
+        '''
+        new_list = []
+        for server_name, publisher_info in self.server_name_publication_info.iteritems():
+            # Find out subscriber list of server_name
+            subs_list = publisher_info['subscriber']
+            self._logger.info("Subscriber list %s of server_name is %s" %(subs_list, server_name))
+
+            # check old server name present in subscriber sublist
+            if subs_list:
+                if old_master_server_name in subs_list:
+                    # Select that server for promotion
+                    server_ip = self.server_name_ip_mapping[server_name]
+                    self._logger.info("Old Server Name %s is present in the sublist of server_name %s and IP is %s"\
+                                      %(old_master_server_name, server_name, server_ip))
+                    new_list.append(server_ip)
+                    continue
+                else:
+                    # Ignoring that server for promotion
+                    self._logger.info("Old Server Name %s is not present in the sublist of server_name %s,"\
+                                      " so ignoring the server for promotion"\
+                                      %(old_master_server_name, server_name))
+            else:
+                self._logger.info("Subscriber list is empty for the server %s" %server_name)
+        return new_list
+
+
+    def detect_topology(self):
+        ''' This Function detect what topology changes we need to do 
+        '''
+        success = True
         error_msg = ""
         abort_failover = False
+        new_promoted_list = []
 
         self._logger.info("Starting Failover Using Transaction/P2P based failover")
         
         # Get All servers publishers info  
         self.get_servers_publishers_info()
         self._logger.info("Got servers publishers info %s" %self.server_name_publication_info)
-        
+       
         # Get Old Master subscriber list
         old_master_sub_list = self.server_name_publication_info[self.old_master_ip]['subscriber']
         old_master_server_name = self.server_name_publication_info[self.old_master_ip]['server_name']
-        self._logger.info("Old Master Subscriber list is %s and Server name is %s" \
-                          %(old_master_sub_list, old_master_server_name))
-
-        # Find out all the server in old_master_sub_list which are in MM replication
-        new_promoted_list = self.find_new_promoted_server(old_master_server_name, old_master_sub_list)
-        if len(new_promoted_list) != 0:
-            self._logger.info("Servers list %s those can be promoted as new master server" %new_promoted_list)
-            return True, abort_failover, error_msg, new_promoted_list
+        
+        #TODO if primary server is down
+        if len(old_master_sub_list) == 0:
+            if self._origin == "gui":
+                self._logger.info("Old Master Subscriber list is empty in Manual Failover Request")
+                new_promoted_list = []
+            elif self._origin == "idbcore":
+                self._logger.info("Finding new servers subscriber list when primary server is down")
+                # Find out all the new server from publishers info
+                new_promoted_list = self.find_new_server_from_publisher_info(old_master_server_name)
         else:
-            self._logger.info("New Servers list  is empty could not find out server for promotion. So Aborting...")
-            return False, True, error_msg, new_promoted_list
+            self._logger.info("Old Master Subscriber list is %s and Server name is %s" \
+                              %(old_master_sub_list, old_master_server_name))
+            # Find out all the server in old_master_sub_list which are in MM replication
+            new_promoted_list = self.find_new_promoted_server(old_master_server_name, old_master_sub_list)
 
-        #self.find_topology()
-        return True, False, ""
+        if len(new_promoted_list) == 0:
+            success = False
+            abort_failover = True
+            error_msg = "Could not find out server with Master-Master Replication"
+            self._logger.info("New Servers list is empty could not find out server for promotion. So Aborting...")
+            return success, abort_failover, error_msg, new_promoted_list
+            
+        self._logger.info("Servers list %s those can be promoted as new master server" %new_promoted_list)
+        return success, abort_failover, error_msg, new_promoted_list
 
     def _create_connection(self, server_details):
         root_account_info = {'username': server_details['username'], 'password': server_details['password']}
-        conn_str = ConnectionData.get_connection_string(server_details['server_ip'], \
+        conn_str = self.get_connection_string(server_details['server_ip'], \
                                   server_details['server_port'], root_account_info)
-        conn = ConnectionData.get_sqlserver_connection(server_details['server_ip'], \
+        conn = self.get_sqlserver_connection(server_details['server_ip'], \
                              int(server_details['server_port']), conn_str, self._logger)
+        return conn
+    
+    def get_connection_string(self, server_ip, server_port, root_account):
+        return "DRIVER={FreeTDS};SERVER=%s;PORT=%s;UID=%s;PWD=%s;TDS_VERSION=8.0;" \
+                    % (server_ip, str(server_port), root_account['username'], root_account['password'])
+
+    def get_sqlserver_connection(self, server_ip, port, conn_str, _logger, max_retry=CONN_RETRY):
+        retry = 0
+        conn = None
+        while retry < max_retry:
+            try:
+                test_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                test_socket.settimeout(SOCKET_TIMEOUT)
+                test_socket.connect((server_ip, port))
+            except socket.error:
+                errno, errstr = sys.exc_info()[:2]
+                if errno == socket.timeout:
+                    self._logger.error("Timeout has occured %s " % (errstr))
+                else:
+                    self._logger.error("Error occured while creating socket connections %s " % (errstr))
+                retry = retry + 1
+                if retry >= max_retry:
+                    self._logger.error("In Socket Failed to make connection with socket " \
+                                  "Max retry limit reached:" )
+                    return conn
+                else:
+                    self._logger.error("Retrying for socket connection ")
+                    continue
+            except Exception, ex:
+                self._logger.info("Some Exception While using socket %s" % (ex))
+                retry = retry + 1
+                if retry >= max_retry:
+                    self._logger.error("In Exception Failed to make connection with socket " \
+                                  "Max retry limit reached:")
+                    return conn
+                else:
+                    self._logger.error("Retrying for socket connection ")
+            finally:
+                if test_socket:
+                    test_socket.close()
+ 
+            try:
+                conn = pyodbc.connect(conn_str, autocommit=True, timeout=MSSQL_LOGIN_TIMEOUT)
+                break
+            except Exception, ex:
+                retry = retry + 1
+                self._logger.info("Was Not Able To Connect : %s" %ex)
+        if conn:
+            self._logger.debug("setting query timeout to %s for ip %s"
+                              % (MSSQL_QUERY_TIMEOUT, server_ip))
+            conn.timeout = MSSQL_QUERY_TIMEOUT
         return conn
 
 def main():
+
+    ''' This is the main function, Script starts from here
+    '''
+    #Read option from command 
     cluster_stats = None
     try:
         opts, args = getopt.getopt(sys.argv[1:],'hc:', ["help", "data="])
     except Exception, ex:
-        print (False,  "Error in command arguments")
-        return 
+        return json.dumps({"success": False, "message": "Error in Command arguments and Exception is %s" %ex})
 
-    #Read option from command 
     for opt in opts:
         if opt[0] == '-c' or opt[0] == '--data':
             cluster_stats = opt[1]
@@ -1364,25 +1411,63 @@ def main():
     # Failover object is initiated
     global APIKEY
     process_failover = ProcessFailover(cluster_stats)
-    APIKEY = ProcessFailover.get_apikey(GLOBAL_LB_DB_FILE, process_failover._logger)
-    process_failover._logger.info("APIKey is %s" %APIKEY)
     
-    if process_failover._verify_failover_request():
-        process_failover._logger.info("failover request is verified")
-            #In case of request from idbcore_force then we will not check demotion_flag
-        if not process_failover._find_server_to_be_demoted():
-            process_failover._logger.error('Failed to find server to be demoted')
-            return json.dumps({"success": False, "message": process_failover._logger.message})
+    APIKEY = process_failover.get_apikey(process_failover._logger)
+    process_failover._logger.info("APIKey is %s" %APIKEY)
 
-        if not process_failover._find_server_to_be_promoted():
-            process_failover._logger.error( 'Failed to find server to be promoted')
-            return json.dumps({"success": False, "message": process_failover._logger.message})
+    if not APIKEY:
+        process_failover._logger.error("Could not find out API Key from ScaleArc API")
+        if process_failover._error_msg:
+            process_failover.send_alert("failover_error", error_message=process_failover._error_msg,)
+        return json.dumps({"success": False, "message": "Error in finding API key from Scalearc API"})
+    
+    # Verify Failover Request    
+    if not process_failover._verify_failover_request():
+        process_failover._logger.error("Could not verify this failover " \
+                                       "request. Operation aborted.")
+        if process_failover._error_msg:
+            process_failover.send_alert("failover_error", error_message=\
+                            'Error verifying failover request: ' + process_failover._error_msg)
+        return json.dumps({"success": False, "message": process_failover._logger.message})
 
-        if not process_failover._perform_role_change():
-            process_failover._logger.error(" Failed to perform role change.")
-            return json.dumps({"success": False, "message": process_failover._logger.message})
+    # Going to perform failover
+    process_failover._logger.info("Going to perform failover")
+
+    # Finding server to be promoted
+    if not process_failover._find_server_to_be_promoted():
+        process_failover._logger.error( 'Failed to find server to be promoted')
+        process_failover._error_msg = 'Failed to find server to be promoted'
+        process_failover.send_alert("failover_error", error_message = process_failover._error_msg)
+        return json.dumps({"success": False, "message": process_failover._logger.message})
+
+    # Finding server to be demoted
+    if not process_failover._find_server_to_be_demoted():
+        process_failover._logger.error('Failed to find server to be demoted')
+        process_failover._error_msg = 'Failed to find server to be demoted'
+        process_failover.send_alert("failover_error", error_message = process_failover._error_msg)
+        return json.dumps({"success": False, "message": process_failover._logger.message})
+
+    # Find out servers for marking offline
+    process_failover.mark_offline = process_failover.find_server_for_marking_offline()
+    if process_failover.mark_offline:
+        process_failover._logger.info("Servers to be marked offline is %s" %process_failover.mark_offline)
+
+    # Performing Role Change
+    if not process_failover._perform_role_change():
+        process_failover._logger.error(" Failed to perform role change.")
+        if process_failover._error_msg:
+            process_failover.send_alert("failover_error", error_message=process_failover._error_msg)
+        return json.dumps({"success": False, "message": process_failover._logger.message})
+
+    #Marking servers offline
+    for server_ip, msg in process_failover.mark_offline.iteritems():
+        process_failover._logger.info("Marking server %s offline as %s" % (server_ip, msg))
+        process_failover._change_mark_server_status(server_ip)
 
     return json.dumps({"success": True, "message": process_failover._logger.message})
 
 if __name__ == '__main__':
-    print main()   
+    res = main()
+    res = json.loads(res)   
+    for msg in res["message"]:
+        print msg
