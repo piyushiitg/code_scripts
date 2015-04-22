@@ -323,7 +323,8 @@ class UpdateThread(object):
         # v4 address
         if self.server_info['cluster_type'] == 'MSSQL':
             self.mssql_db_connection()
-        elif self.server_info['cluster_type'] == 'ORACLE'
+        elif self.server_info['cluster_type'] == 'ORACLE':
+            _logger.info("Connecting with oracle server %s" %self.server_info)
             self.oracle_db_connection()
 
     def mssql_db_connection(self):
@@ -380,36 +381,22 @@ class UpdateThread(object):
                           % (self._cluster_id, self._server_id, self._server_ip))
             time.sleep(1)
 
-        is_windows_user = False
-        domain_name = None
-        user_name = None
         try:
-            domain_name, user_name = self._user.split('\\')
-            is_windows_user = True
-        except Exception, ex:
-            _logger.debug("UpdateThread(%d:%d): Not a windows user " \
-                           % (self._cluster_id, self._server_id))
- 
-        default_conn_string = "DRIVER={FreeTDS};Server=" + str(self._server_ip) + \
-                              ";Port=" + str(self._server_port) + ";UID=" + \
-                              str(self._user) + ";PWD=" + str(self._password) + \
-                              ";autocommit=True;TDS_VERSION=7.2;"
-        if is_windows_user:
-            self._conn_string = default_conn_string + \
-                                "UseNTLMV2=Yes;Trusted_Domain=" + str(domain_name)+";"
-        else:
-            self._conn_string = default_conn_string
+            if self.server_info["sid_type"] == 2:
+                # socket_retry = 3 and socket_timeout = 1
+                self._dbconn, self._dbcursor, error_msg = util.get_oracle_connection(self._server_ip, self._server_port,\
+                              self._user, self._password, self.server_info["sid_name"], self.server_info["sid_type"], 
+                              3, 1)
+            else:
+                self._dbconn, self._dbcursor, error_msg = util.get_oracle_connection(self._server_ip, self._server_port,\
+                              self._user, self._password, self.server_info["service_name"], self.server_info["sid_type"], 
+                              3, 1)
 
-        try:
-            self._dbconn = pyodbc.connect(self._conn_string, timeout=MSSQL_LOGIN_TIMEOUT)
-            self._dbconn.timeout = QUERY_TIMEOUT
-            self._dbcursor = self._dbconn.cursor()
         except Exception,ex:
             err_msg = 'Could not connect to database.'
             _logger.error("UpdateThread(%d:%d): Failed to connect to db: %s" \
                           % (self._cluster_id, self._server_id, ex))
             raise Exception(err_msg)
-
 
     def get_server_hash(self):
         '''
@@ -429,19 +416,48 @@ class UpdateThread(object):
         if self._hash == '':
             self.get_server_hash()
 
-        insert_query = "if not exists (select * from [%s].[dbo].[%s] where " \
-                        "server_hash = '%s') INSERT INTO [%s].[dbo].[idb_drlms]" \
-                        " ([server_hash],[ts],[exec_ts]) VALUES ('%s','%s','%s')" \
-                        % ( self._dbname, self._table_name, self._hash, \
-                            self._dbname, self._hash, time.time(), time.time())
+        if self.server_info['cluster_type'] == 'ORACLE':
+            select_query = "select * from [%s].[%s] where server_hash = '%s'"\
+                           % ( self._dbname, self._table_name, self._hash)
 
-        try:
-            self._dbcursor.execute(insert_query)
-        except Exception,ex:
-            _logger.error("UpdateThread(%d:%d): Failed to create db: %s" \
-                          % (self._cluster_id, self._server_id, ex))
-            self._dbconn.close()
-            return False
+            result_found = False
+            try:
+                self._dbcursor.execute(select_query)
+                row =  self._dbcursor.fetchone()
+                if len(row) > 0:
+                    result_found = True
+            except Exception, ex:
+                _logger.error("Exception while executing select query %s" %ex)
+                result_found = False
+            
+            if not result_found:
+                insert_query = "INSERT INTO [%s].[idb_drlms]" \
+                               " ([server_hash],[ts],[exec_ts]) VALUES ('%s','%s','%s')" \
+                                   %( self._dbname, self._hash, time.time(), time.time())
+
+            try:
+                self._dbcursor.execute(insert_query)
+            except Exception,ex:
+                _logger.error("UpdateThread(%d:%d): Failed to create db: %s" \
+                              % (self._cluster_id, self._server_id, ex))
+                self._dbconn.close()
+                return False
+
+        elif self.server_info['cluster_type'] == 'MSSQL':
+            insert_query = "if not exists (select * from [%s].[dbo].[%s] where " \
+                           "server_hash = '%s') INSERT INTO [%s].[dbo].[idb_drlms]" \
+                           " ([server_hash],[ts],[exec_ts]) VALUES ('%s','%s','%s')" \
+                           % ( self._dbname, self._table_name, self._hash, \
+                               self._dbname, self._hash, time.time(), time.time())
+          
+            try:
+                self._dbcursor.execute(insert_query)
+            except Exception,ex:
+                _logger.error("UpdateThread(%d:%d): Failed to create db: %s" \
+                              % (self._cluster_id, self._server_id, ex))
+                self._dbconn.close()
+                return False
+
         return True
 
     def get_server_ts(self):
@@ -459,8 +475,13 @@ class UpdateThread(object):
 #              self._dbname, self._hash, time.time())
 
         exec_ts = str(time.time())
-        update_query = "exec %s.dbo.sp_idb_drlms_update '%s',%s,%s" \
-                        % (self._dbname, self._hash, exec_ts, exec_ts)
+        #FIXME ORacle execute 
+        if self.server_info['cluster_type'] == 'ORACLE':
+            update_query = "EXECUTE %s.sp_idb_drlms_update('%s',%s,%s" \
+                            % (self._dbname, self._hash, exec_ts, exec_ts))
+        elif self.server_info['cluster_type'] == 'MSSQL':
+            update_query = "exec %s.dbo.sp_idb_drlms_update '%s',%s,%s" \
+                            % (self._dbname, self._hash, exec_ts, exec_ts)
 
         try:
             self._dbcursor.execute(update_query)
@@ -471,10 +492,13 @@ class UpdateThread(object):
             return 0
 
         # now fetch the timestamp
-        select_query = "select server_hash,ts,exec_ts from %s.dbo.%s where " \
-                        "server_hash = '%s'" % (self._dbname, self._table_name, \
+        if self.server_info['cluster_type'] == 'ORACLE':
+            select_query = "select server_hash,ts,exec_ts from %s.%s where " \
+                            "server_hash = '%s'" % (self._dbname, self._table_name, \
                                                 self._hash)
-
+        elif self.server_info['cluster_type'] == 'MSSQL':
+            select_query = "select server_hash,ts,exec_ts from %s.dbo.%s where " \
+                            "server_hash = '%s'" % (self._dbname, self._table_name, \
         try:
             self._dbcursor.execute(select_query)
             row =  self._dbcursor.fetchone()
@@ -499,7 +523,7 @@ class UpdateThread(object):
 
 class FetchThread(object):
     def __init__(self, cluster_id, server_id, server_ip, server_port, db_name, \
-                 table_name, user_name, password, role):
+                 table_name, user_name, password, server):
         self._cluster_id = cluster_id
         self._server_id = server_id
         self._server_ip = server_ip
@@ -511,8 +535,8 @@ class FetchThread(object):
         self._dbconn = None
         self._dbcursor = None
         self._table_name = table_name
-        self._role = role
-
+        self._role = server['role']
+        self.server_info = server
         # connect to db
         self._create_connection()
 
@@ -559,7 +583,46 @@ class FetchThread(object):
         '''
         Create db connection.
         '''
-        
+        if self.server_info['cluster_type'] == 'MSSQL':
+            self.mssql_db_connection()
+        elif self.server_info['cluster_type'] == 'ORACLE':
+            _logger.info("Connecting with oracle server %s" %self.server_info)
+            self.oracle_db_connection()
+
+    def oracle_db_connection(self):
+        ''' Oracle Connection
+        '''
+        while True:
+            server_ip = self._get_proper_server_addr(self._server_ip)
+            if server_ip != '':
+                self._server_ip = server_ip
+                break
+            _logger.error("FetcherThread(%d:%d): Failed to resolve server hostname: %s" \
+                          % (self._cluster_id, self._server_id, self._server_ip))
+            time.sleep(1)
+
+        try:
+            if self.server_info["sid_type"] == 2:
+                # socket_retry = 3 and socket_timeout = 1
+                self._dbconn, self._dbcursor, error_msg = util.get_oracle_connection(self._server_ip, self._server_port,\
+                              self._user, self._password, self.server_info["sid_name"], self.server_info["sid_type"], 
+                              3, 1)
+            else:
+                self._dbconn, self._dbcursor, error_msg = util.get_oracle_connection(self._server_ip, self._server_port,\
+                              self._user, self._password, self.server_info["service_name"], self.server_info["sid_type"], 
+                              3, 1)
+
+        except Exception,ex:
+            err_msg = 'Could not connect to database.'
+            _logger.error("FetcherThread(%d:%d): Failed to connect to db: %s" \
+                          % (self._cluster_id, self._server_id, ex))
+            raise Exception(err_msg)
+
+
+    def mssql_db_connection(self):
+        '''
+        Create db connection.
+        '''
         while True:
             server_ip = self._get_proper_server_addr(self._server_ip)
             if server_ip != '':
@@ -631,8 +694,14 @@ class FetchThread(object):
         '''
 
         # now fetch the timestamp
-        select_query = "select server_hash,ts,exec_ts from %s.dbo.%s" \
-                        % (self._dbname, self._table_name,)
+        # TODO: query may change for ORACLE
+        if self.server_info['cluster_type'] == 'ORACLE':
+            select_query = "select server_hash,ts,exec_ts from %s.%s" \
+                            % (self._dbname, self._table_name,)
+        elif self.server_info['cluster_type'] == 'MSSQL':
+            select_query = "select server_hash,ts,exec_ts from %s.dbo.%s" \
+                            % (self._dbname, self._table_name,)
+            
         rows = []
         #
         # we will use a new connection every time because of an issue with pyodbc
@@ -1026,7 +1095,7 @@ class ClusterMonitor(object):
                                server['ipaddress'], server['port'], \
                                self._dbname, self._table_name, \
                                self._root_accnt_info['username'], \
-                               self._root_accnt_info['password'], server['role'])
+                               self._root_accnt_info['password'], server)
         except:
             # what do we do ?
             _logger.error("FetchThread(%d:%d): Failed to get FetchThread " \
